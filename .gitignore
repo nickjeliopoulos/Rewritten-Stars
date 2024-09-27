@@ -160,3 +160,12 @@ cython_debug/
 #.idea/
 .DS_Store
 /.idea
+
+#
+# Custom
+#
+imagenet/model_profiles/
+imagenet/onnx_models/
+imagenet/scripts/
+*.csv
+*.txt
