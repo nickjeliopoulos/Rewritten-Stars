@@ -16,7 +16,7 @@ class FusedParallelLinear(nn.Module):
 
 
 	def forward(self, x : torch.Tensor, d : torch.Tensor = None, op : str = "mul") -> torch.Tensor:
-		print(f"x.shape {x.shape}")
+		# print(f"x.shape {x.shape}")
 		"""
 		x : input tensor
 		d : (optional) destination tensor

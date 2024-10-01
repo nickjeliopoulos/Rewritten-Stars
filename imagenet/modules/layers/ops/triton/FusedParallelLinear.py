@@ -274,19 +274,20 @@ def _parallel_linear_fwd_kernel_fp32_add(
 ###
 ### Fused FC Layer
 ###
-@triton.autotune(minimal_autotune_configs, key=['OUT_CHANNELS', 'IN_CHANNELS', 'BATCH_SIZE'])
+@triton.autotune(minimal_autotune_configs, key=['OUT_CHANNELS', 'HEIGHT', 'WIDTH', 'IN_CHANNELS', 'BATCH_SIZE'])
 @triton.jit
 def _parallel_linear_fwd_kernel_fp32_mul(
         W,       # (2, O, I)
-        X,       # (B, I) 
-        D,       # (B, O) (should share stride)
-        # T0, T1,  # (B, O)
+        X,       # (B, I, H, W) 
+        D,       # (B, O, H, W)
         stride_wp, stride_wo, stride_wi,
-        stride_xb, stride_xi,
-        stride_db, stride_do,
+        stride_xb, stride_xi, stride_xh, stride_xw,
+        stride_db, stride_do, stride_dh, stride_dw,
         IN_CHANNELS: tl.constexpr,
         OUT_CHANNELS: tl.constexpr,
         BATCH_SIZE: tl.constexpr,
+        HEIGHT : tl.constexpr,
+        WIDTH : tl.constexpr,
         ### Metaparams
         BLOCK_O: tl.constexpr,
         BLOCK_I: tl.constexpr,
@@ -297,9 +298,8 @@ def _parallel_linear_fwd_kernel_fp32_mul(
     ### Which program are we?
     # program_I_id = tl.program_id(axis=1)
     program_O_id = tl.program_id(axis=0)
-    program_y_id = tl.program_id(axis=1)
-    program_id = program_O_id + program_y_id
-    # epilogue_block = (program_id == (2 * OUT_CHANNELS) - 1)
+    program_H_id = tl.program_id(axis=1)
+    program_W_id = tl.program_id(axis=2)
 
     ### Compute any offsets
     O_offset = program_O_id * BLOCK_O
@@ -307,7 +307,7 @@ def _parallel_linear_fwd_kernel_fp32_mul(
     ### Create pointers!
     ### TODO: Coalesce memory loading 
     WT1_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 0 ) + ( 0 ),
+        base=W + ( stride_wp * 0 ),
         shape=(IN_CHANNELS, OUT_CHANNELS),
         strides=(stride_wi, stride_wo),
         offsets=(0, O_offset),
@@ -317,7 +317,7 @@ def _parallel_linear_fwd_kernel_fp32_mul(
 
     ### Create pointers!
     WT2_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 1 ) + ( 0 ),
+        base=W + ( stride_wp * 1 ),
         shape=(IN_CHANNELS, OUT_CHANNELS),
         strides=(stride_wi, stride_wo),
         offsets=(0, O_offset),
@@ -326,7 +326,7 @@ def _parallel_linear_fwd_kernel_fp32_mul(
     )
 
     X_block_ptr = tl.make_block_ptr(
-        base=X + ( 0 ),
+        base=X + (stride_xh * program_H_id) + (stride_xw * program_W_id),
         shape=(BATCH_SIZE, IN_CHANNELS),
         strides=(stride_xb, stride_xi),
         offsets=(0, 0),
@@ -335,7 +335,7 @@ def _parallel_linear_fwd_kernel_fp32_mul(
     )
 
     D_block_ptr = tl.make_block_ptr(
-        base=D + ( 0 ),
+        base=D + (stride_dh * program_H_id) + (stride_dw * program_W_id),
         shape=(BATCH_SIZE, OUT_CHANNELS),
         strides=(stride_db, stride_do),
         offsets=(0, O_offset),
@@ -355,8 +355,8 @@ def _parallel_linear_fwd_kernel_fp32_mul(
         wt1 = tl.load(WT1_block_ptr, padding_option="zero", boundary_check=(0,1))
         wt2 = tl.load(WT2_block_ptr, padding_option="zero", boundary_check=(0,1))
 
-        t0_accum = tl.dot(x, wt1, acc=t0_accum)
-        t1_accum = tl.dot(x, wt2, acc=t1_accum)
+        t0_accum = tl.dot(x, wt1, acc=t0_accum, input_precision="ieee")
+        t1_accum = tl.dot(x, wt2, acc=t1_accum, input_precision="ieee")
 
         ### Advance pointers
         X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_I))
@@ -373,13 +373,13 @@ def _parallel_linear_fwd_kernel_fp32_mul(
 ###
 def parallel_linear_fwd_fp32(
     W : torch.Tensor, # (2, OUT_CHANNELS, IN_CHANNELS)
-    X : torch.Tensor, # (BATCH_SIZE, IN_CHANNELS)
-    D : torch.Tensor = None, # (BATCH_SIZE, OUT_CHANNELS)
+    X : torch.Tensor, # (BATCH_SIZE, IN_CHANNELS, HEIGHT, WIDTH)
+    D : torch.Tensor = None, # (BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH)
     op : str = "add",
 ) -> torch.Tensor:    
     ### Get input shapes
-    _, OUT_CHANNELS, IN_CHANNELS  = W.shape
-    BATCH_SIZE, _ = X.shape
+    _, OUT_CHANNELS, _  = W.shape
+    BATCH_SIZE, IN_CHANNELS, HEIGHT, WIDTH = X.shape
 
     ### Input Checking
     assert W.is_contiguous() and X.is_contiguous(), "Must have contiguous tensors"
@@ -389,98 +389,80 @@ def parallel_linear_fwd_fp32(
 
     ### Allocates output destination
     if not D:
-        D = torch.empty((BATCH_SIZE, OUT_CHANNELS), device=W.device, dtype=W.dtype, requires_grad=False).contiguous()
+        D = torch.empty((BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH), device=W.device, dtype=W.dtype, requires_grad=False).contiguous()
 
     # T0 = torch.empty((BATCH_SIZE, OUT_CHANNELS), device=W.device, dtype=W.dtype, requires_grad=False).contiguous()
     # T1 = torch.empty((BATCH_SIZE, OUT_CHANNELS), device=W.device, dtype=W.dtype, requires_grad=False).contiguous()
 
     ### NOTE: 3D Kernel launch grid, we can change the 2nd dimension in case we decide to not do interleaved computation
     ### NOTE: Can use jobid to decide behavior by doing that
-    grid = lambda META: (triton.cdiv(OUT_CHANNELS, META['BLOCK_O']), 1, 1)
+    grid = lambda META: (triton.cdiv(OUT_CHANNELS, META['BLOCK_O']), HEIGHT, WIDTH)
 
     ### Launch it!
-    if op == "add":
-        kernel = _parallel_linear_fwd_kernel_fp32_add[grid](
-            ### Standard params
-            W, X, D,
-            # T0, T1,
-            W.stride(0), W.stride(1), W.stride(2),
-            X.stride(0), X.stride(1),
-            D.stride(0), D.stride(1),
-            IN_CHANNELS,
-            OUT_CHANNELS,
-            ### Metaparameters go here
-            BATCH_SIZE,
-        )
-    elif op == "mul":
-        kernel = _parallel_linear_fwd_kernel_fp32_mul[grid](
-            ### Standard params
-            W, X, D,
-            # T0, T1,
-            W.stride(0), W.stride(1), W.stride(2),
-            X.stride(0), X.stride(1),
-            D.stride(0), D.stride(1),
-            IN_CHANNELS,
-            OUT_CHANNELS,
-            ### Metaparameters go here
-            BATCH_SIZE,
-        )   
+    # if op == "add":
+    #     kernel = _parallel_linear_fwd_kernel_fp32_add[grid](
+    #         ### Standard params
+    #         W, X, D,
+    #         # T0, T1,
+    #         W.stride(0), W.stride(1), W.stride(2),
+    #         X.stride(0), X.stride(1),
+    #         D.stride(0), D.stride(1),
+    #         IN_CHANNELS,
+    #         OUT_CHANNELS,
+    #         BATCH_SIZE,
+    #     )
+    # elif op == "mul":
+    kernel = _parallel_linear_fwd_kernel_fp32_mul[grid](
+        ### Standard params
+        W, X, D,
+        W.stride(0), W.stride(1), W.stride(2),
+        X.stride(0), X.stride(1), X.stride(2), X.stride(3),
+        D.stride(0), D.stride(1), D.stride(2), D.stride(3),
+        IN_CHANNELS,
+        OUT_CHANNELS,
+        BATCH_SIZE,
+        HEIGHT,
+        WIDTH,
+    )   
 
     return D
 
 
 if __name__ == "__main__":
+    torch.set_printoptions(sci_mode=True)
+
     device = torch.device("cuda:0")
-
-    print(f"=== Linear ===")
-
-    B, I, O = 16, 64, 128
-
-    W = torch.randn((O,I), device=device, dtype=torch.float32, requires_grad=False)
-    X = torch.randn((B,I), device=device, dtype=torch.float32, requires_grad=False)
-
-    triton_linear = linear_fwd_fp32(W, X)
-    torchf_linear = torch.nn.functional.linear(X, W)
-
-    print(f"Triton shape: {triton_linear.shape}")
-    print(f"Triton: {triton_linear}")
-
-    print(f"torch.F shape: {torchf_linear.shape}")
-    print(f"torch.F: {torchf_linear}")
-
-    print(f"max diff: {torch.max(torchf_linear-triton_linear):.4f}")
-
-    print(f"=== Interleaved Linear Add ===")
-
-    B, I, O = 16, 64, 128
-
+    B, I, O, HEIGHT, WIDTH = 16, 64, 128, 16, 16
     W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
-    X = torch.randn((B,I), device=device, dtype=torch.float32, requires_grad=False)
+    X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)
 
-    triton_parallel_linear_add = parallel_linear_fwd_fp32(W, X, op="add")
-    torchf_linear_1 = torch.nn.functional.linear(X, W[0])
-    torchf_linear_2 = torch.nn.functional.linear(X, W[1])
-    torchf_linear_add = torch.nn.functional.silu(torchf_linear_1) + torchf_linear_2
+    # print(f"=== Linear ===")
 
-    print(f"Triton parallel shape: {triton_parallel_linear_add.shape}")
-    print(f"Triton parallel: {triton_parallel_linear_add}")
+    # W = torch.randn((O,I), device=device, dtype=torch.float32, requires_grad=False)
+    # X = torch.randn((B,I), device=device, dtype=torch.float32, requires_grad=False)
 
-    print(f"torch.F serial shape: {torchf_linear_add.shape}")
-    print(f"torch.F serial: {torchf_linear_add}")
+    # triton_linear = linear_fwd_fp32(W, X)
+    # torchf_linear = torch.nn.functional.linear(X, W)
 
-    print(f"max diff: {torch.max(torchf_linear_add-triton_parallel_linear_add):.4f}")
+    # print(f"max diff: {torch.max(torchf_linear-triton_linear):.4f}")
+
+    # print(f"=== Interleaved Linear Add ===")
+
+    # W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
+    # X = torch.randn((B,I), device=device, dtype=torch.float32, requires_grad=False)
+
+    # triton_parallel_linear_add = parallel_linear_fwd_fp32(W, X, op="add")
+    # torchf_linear_1 = torch.nn.functional.linear(X, W[0])
+    # torchf_linear_2 = torch.nn.functional.linear(X, W[1])
+    # torchf_linear_add = torch.nn.functional.silu(torchf_linear_1) + torchf_linear_2
+
+    # print(f"max diff: {torch.max(torchf_linear_add-triton_parallel_linear_add):.4f}")
 
     print(f"=== Interleaved Linear Mul ===")
 
     triton_parallel_linear_mul = parallel_linear_fwd_fp32(W, X, op="mul")
-    torchf_linear_1 = torch.nn.functional.linear(X, W[0])
-    torchf_linear_2 = torch.nn.functional.linear(X, W[1])
+    torchf_linear_1 = torch.nn.functional.conv2d(X, W[0,:,:,None,None])
+    torchf_linear_2 = torch.nn.functional.conv2d(X, W[1,:,:,None,None])
     torchf_linear_mul = torch.nn.functional.silu(torchf_linear_1) * torchf_linear_2
 
-    print(f"Triton parallel shape: {triton_parallel_linear_mul.shape}")
-    print(f"Triton parallel: {triton_parallel_linear_mul}")
-
-    print(f"torch.F serial shape: {torchf_linear_mul.shape}")
-    print(f"torch.F serial: {torchf_linear_mul}")
-
-    print(f"max diff: {torch.max(torchf_linear_mul-triton_parallel_linear_mul):.4f}")
+    print(f"max diff: {torch.max(torchf_linear_mul-triton_parallel_linear_mul)}")
