@@ -428,7 +428,7 @@ if __name__ == "__main__":
     torch.set_printoptions(sci_mode=True)
 
     device = torch.device("cuda:0")
-    B, I, O, HEIGHT, WIDTH = 16, 64, 128, 16, 16
+    B, I, O, HEIGHT, WIDTH = 32, 32, 64, 56, 56
     W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
     X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)
 
@@ -462,3 +462,14 @@ if __name__ == "__main__":
     torchf_linear_mul = torch.nn.functional.silu(torchf_linear_1) * torchf_linear_2
 
     print(f"max diff: {torch.max(torchf_linear_mul-triton_parallel_linear_mul)}")
+    print(f"triton: {triton_parallel_linear_mul[0,0:2,0:4,0:4]}")
+    print(f"torch: {torchf_linear_mul[0,0:2,0:4,0:4]}")
+
+    print(f"=== Interleaved Linear Add ===")
+
+    triton_parallel_linear_add = parallel_linear_fwd_fp32(W, X, op="add")
+    torchf_linear_add = torch.nn.functional.silu(torchf_linear_1) + torchf_linear_2
+
+    print(f"max diff: {torch.max(triton_parallel_linear_add-torchf_linear_add)}")
+    print(f"triton: {triton_parallel_linear_add[0,0:2,0:4,0:4]}")
+    print(f"torch: {torchf_linear_add[0,0:2,0:4,0:4]}")
