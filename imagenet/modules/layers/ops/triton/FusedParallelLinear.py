@@ -306,10 +306,40 @@ def parallel_linear_fwd_fp32(
 
 
 if __name__ == "__main__":
+    def benchmark_latency(W, X, op : str, N : int = 128):
+        def _torch_mul(W, X):
+            A = torch.nn.functional.conv2d(X, W[0,:,:,None,None])
+            B = torch.nn.functional.conv2d(X, W[1,:,:,None,None])
+            C = torch.nn.functional.silu(A) * B
+            return C
+
+        def _torch_add(W, X):
+            A = torch.nn.functional.conv2d(X, W[0,:,:,None,None])
+            B = torch.nn.functional.conv2d(X, W[1,:,:,None,None])
+            C = torch.nn.functional.silu(A) + B
+            return C
+
+        t0 = benchmark.Timer(
+            stmt="f(W,X)",
+            globals={'f' : _torch_mul if op == "mul" else _torch_add, 'W' : W, 'X' : X},
+        )
+
+        torch_measurement = t0.timeit(N)
+
+        t1 = benchmark.Timer(
+            stmt="f(W,X,None,op)",
+            globals={'f' : parallel_linear_fwd_fp32, 'W' : W, 'X' : X, 'op' : op},
+        )
+
+        triton_measurement = t1.timeit(N)
+
+        return (torch_measurement.median * 1e6, triton_measurement.median * 1e6)
+
+
     torch.set_printoptions(sci_mode=True)
 
     device = torch.device("cuda:0")
-    B, I, O, HEIGHT, WIDTH = 16, 16, 32, 4, 4
+    B, I, O, HEIGHT, WIDTH = 16, 64, 128, 8, 8
     W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
     X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)
 
@@ -320,15 +350,21 @@ if __name__ == "__main__":
     torchf_linear_2 = torch.nn.functional.conv2d(X, W[1,:,:,None,None])
     torchf_linear_mul = torch.nn.functional.silu(torchf_linear_1) * torchf_linear_2
 
+    torch_us, triton_us = benchmark_latency(W, X, op="mul")
+
     print(f"max diff: {torch.max(torchf_linear_mul-triton_parallel_linear_mul)}")
-    print(f"triton: {triton_parallel_linear_mul[0,0:2,0:4,0:4]}")
-    print(f"torch: {torchf_linear_mul[0,0:2,0:4,0:4]}")
+    print(f"latency torch / triton: {torch_us:.3f} / {triton_us:.3f}")
 
     print(f"\n=== Interleaved Linear Add ===")
 
     triton_parallel_linear_add = parallel_linear_fwd_fp32(W, X, op="add")
+    torchf_linear_1 = torch.nn.functional.conv2d(X, W[0,:,:,None,None])
+    torchf_linear_2 = torch.nn.functional.conv2d(X, W[1,:,:,None,None])
     torchf_linear_add = torch.nn.functional.silu(torchf_linear_1) + torchf_linear_2
 
+    torch_us, triton_us = benchmark_latency(W, X, op="add")
+
     print(f"max diff: {torch.max(triton_parallel_linear_add-torchf_linear_add)}")
-    print(f"triton: {triton_parallel_linear_add[0,0:2,0:4,0:4]}")
-    print(f"torch: {torchf_linear_add[0,0:2,0:4,0:4]}")
+    print(f"latency torch / triton: {torch_us:.3f} / {triton_us:.3f}")
+    
+    print(f"\n=== Done! ===")
