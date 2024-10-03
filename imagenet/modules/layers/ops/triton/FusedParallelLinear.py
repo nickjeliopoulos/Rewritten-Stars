@@ -40,8 +40,8 @@ def gelu_activation_fwd_kernel(x : tl.tensor) -> tl.tensor:
 ###
 minimal_autotune_configs = [
     triton.Config({'BLOCK_O': BM, 'BLOCK_I': BK}, num_stages=s, num_warps=w) \
-    for BM in [64, 128]\
-    for BK in [64, 128, 256]\
+    for BM in [32]\
+    for BK in [32]\
     for s in [2, 4]\
     for w in [4, 8]\
 ]
@@ -312,28 +312,6 @@ if __name__ == "__main__":
     B, I, O, HEIGHT, WIDTH = 16, 16, 32, 4, 4
     W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
     X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)
-
-    # print(f"=== Linear ===")
-
-    # W = torch.randn((O,I), device=device, dtype=torch.float32, requires_grad=False)
-    # X = torch.randn((B,I), device=device, dtype=torch.float32, requires_grad=False)
-
-    # triton_linear = linear_fwd_fp32(W, X)
-    # torchf_linear = torch.nn.functional.linear(X, W)
-
-    # print(f"max diff: {torch.max(torchf_linear-triton_linear):.4f}")
-
-    # print(f"=== Interleaved Linear Add ===")
-
-    # W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
-    # X = torch.randn((B,I), device=device, dtype=torch.float32, requires_grad=False)
-
-    # triton_parallel_linear_add = parallel_linear_fwd_fp32(W, X, op="add")
-    # torchf_linear_1 = torch.nn.functional.linear(X, W[0])
-    # torchf_linear_2 = torch.nn.functional.linear(X, W[1])
-    # torchf_linear_add = torch.nn.functional.silu(torchf_linear_1) + torchf_linear_2
-
-    # print(f"max diff: {torch.max(torchf_linear_add-triton_parallel_linear_add):.4f}")
 
     print(f"=== Interleaved Linear Mul ===")
 
