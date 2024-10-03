@@ -75,12 +75,13 @@ def _parallel_linear_fwd_kernel_fp32_add(
         ### Metaparams
         BLOCK_O: tl.constexpr,
         BLOCK_I: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_W: tl.constexpr,
 ):
     ### Kernel-wide constants
     dtype = tl.float32
 
     ### Which program are we?
-    # program_I_id = tl.program_id(axis=1)
     program_O_id = tl.program_id(axis=0)
     program_H_id = tl.program_id(axis=1)
     program_W_id = tl.program_id(axis=2)
@@ -88,67 +89,81 @@ def _parallel_linear_fwd_kernel_fp32_add(
     ### Compute any offsets
     O_offset = program_O_id * BLOCK_O
 
-    ### Create pointers!
-    ### TODO: Coalesce memory loading 
-    WT1_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 0 ),
-        shape=(IN_CHANNELS, OUT_CHANNELS),
-        strides=(stride_wi, stride_wo),
-        offsets=(0, O_offset),
-        block_shape=(BLOCK_I, BLOCK_O),
-        order=(0, 1),
-    )
+    ### NOTE: Can we move the D block pointer outside one of these loops?
+    ### Can we store D less often? (transfer more at once, coalesce?)
+    ### I think we can somehow. Need to just mess around with indexing here
+    for h in range(0, tl.minimum(BLOCK_H, HEIGHT - (program_H_id * BLOCK_H))):
+        h_offset = h + (program_H_id * BLOCK_H)
+        for w in range(0, tl.minimum(BLOCK_W, WIDTH - (program_W_id * BLOCK_W))):
+            w_offset = w + (program_W_id * BLOCK_W)
 
-    WT2_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 1 ),
-        shape=(IN_CHANNELS, OUT_CHANNELS),
-        strides=(stride_wi, stride_wo),
-        offsets=(0, O_offset),
-        block_shape=(BLOCK_I, BLOCK_O),
-        order=(0, 1),
-    )
+            ### Create weight block pointer
+            WT1_block_ptr = tl.make_block_ptr(
+                base=W + ( stride_wp * 0 ),
+                shape=(IN_CHANNELS, OUT_CHANNELS),
+                strides=(stride_wi, stride_wo),
+                offsets=(0, O_offset),
+                block_shape=(BLOCK_I, BLOCK_O),
+                order=(0, 1),
+            )
 
-    X_block_ptr = tl.make_block_ptr(
-        base=X + (stride_xh * program_H_id) + (stride_xw * program_W_id),
-        shape=(BATCH_SIZE, IN_CHANNELS),
-        strides=(stride_xb, stride_xi),
-        offsets=(0, 0),
-        block_shape=(BATCH_SIZE, BLOCK_I),
-        order=(1, 0),
-    )
+            WT2_block_ptr = tl.make_block_ptr(
+                base=W + ( stride_wp * 1 ),
+                shape=(IN_CHANNELS, OUT_CHANNELS),
+                strides=(stride_wi, stride_wo),
+                offsets=(0, O_offset),
+                block_shape=(BLOCK_I, BLOCK_O),
+                order=(0, 1),
+            )
 
-    D_block_ptr = tl.make_block_ptr(
-        base=D + (stride_dh * program_H_id) + (stride_dw * program_W_id),
-        shape=(BATCH_SIZE, OUT_CHANNELS),
-        strides=(stride_db, stride_do),
-        offsets=(0, O_offset),
-        block_shape=(BATCH_SIZE, BLOCK_O),
-        order=(1, 0),
-    )
+            ### Create X and D block pointers (depend on h, w)
+            X_block_ptr = tl.make_block_ptr(
+                base=X + (stride_xh * h_offset) + (stride_xw * w_offset),
+                shape=(BATCH_SIZE, IN_CHANNELS),
+                strides=(stride_xb, stride_xi),
+                offsets=(0, 0),
+                block_shape=(BATCH_SIZE, BLOCK_I),
+                order=(1, 0),
+            )
 
-    ### Accumulation terms
-    t0_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
-    t1_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
+            D_block_ptr = tl.make_block_ptr(
+                base=D + (stride_dh * h_offset) + (stride_dw * w_offset),
+                shape=(BATCH_SIZE, OUT_CHANNELS),
+                strides=(stride_db, stride_do),
+                offsets=(0, O_offset),
+                block_shape=(BATCH_SIZE, BLOCK_O),
+                order=(1, 0),
+            )
 
-    for k in range(0, tl.cdiv(IN_CHANNELS, BLOCK_I)):
-        ### Load chunk of x
-        x = tl.load(X_block_ptr, padding_option="zero", boundary_check=(0,1))
+            ### Accumulation terms
+            t0_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
+            t1_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
 
-        ### Load w1, w2
-        wt1 = tl.load(WT1_block_ptr, padding_option="zero", boundary_check=(0,1))
-        wt2 = tl.load(WT2_block_ptr, padding_option="zero", boundary_check=(0,1))
+            k_upper_bound = tl.cdiv(IN_CHANNELS, BLOCK_I)
 
-        t0_accum = tl.dot(x, wt1, acc=t0_accum, input_precision="ieee")
-        t1_accum = tl.dot(x, wt2, acc=t1_accum, input_precision="ieee")
+            for k in range(0, k_upper_bound):
+                ### Load chunk of x
+                x = tl.load(X_block_ptr, padding_option="zero", boundary_check=(0,1))
 
-        ### Advance pointers
-        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_I))
-        WT1_block_ptr = tl.advance(WT1_block_ptr, (BLOCK_I, 0))
-        WT2_block_ptr = tl.advance(WT2_block_ptr, (BLOCK_I, 0))
+                ### Load w1, w2
+                wt1 = tl.load(WT1_block_ptr, padding_option="zero", boundary_check=(0,1))
+                wt2 = tl.load(WT2_block_ptr, padding_option="zero", boundary_check=(0,1))
 
+                t0_accum = tl.dot(x, wt1, acc=t0_accum, input_precision="ieee")
+                t1_accum = tl.dot(x, wt2, acc=t1_accum, input_precision="ieee")
 
-    ### Epilogue
-    tl.store(D_block_ptr, silu_activation_fwd_kernel(t0_accum) + t1_accum, boundary_check=(0,1))
+                ### Advance pointers
+                X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_I))
+                WT1_block_ptr = tl.advance(WT1_block_ptr, (BLOCK_I, 0))
+                WT2_block_ptr = tl.advance(WT2_block_ptr, (BLOCK_I, 0))
+
+            ### Reset WT1, WT2 pointers
+            # WT1_block_ptr = tl.advance(WT1_block_ptr, (-BLOCK_I * k_upper_bound, 0))
+            # WT2_block_ptr = tl.advance(WT2_block_ptr, (-BLOCK_I * k_upper_bound, 0))
+
+            ### Epilogue
+            tl.store(D_block_ptr, silu_activation_fwd_kernel(t0_accum) + t1_accum, boundary_check=(0,1))
+
 
 
 ###
@@ -171,12 +186,13 @@ def _parallel_linear_fwd_kernel_fp32_mul(
         ### Metaparams
         BLOCK_O: tl.constexpr,
         BLOCK_I: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_W: tl.constexpr,
 ):
     ### Kernel-wide constants
     dtype = tl.float32
 
     ### Which program are we?
-    # program_I_id = tl.program_id(axis=1)
     program_O_id = tl.program_id(axis=0)
     program_H_id = tl.program_id(axis=1)
     program_W_id = tl.program_id(axis=2)
@@ -184,67 +200,80 @@ def _parallel_linear_fwd_kernel_fp32_mul(
     ### Compute any offsets
     O_offset = program_O_id * BLOCK_O
 
-    ### Create pointers!
-    ### TODO: Coalesce memory loading 
-    WT1_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 0 ),
-        shape=(IN_CHANNELS, OUT_CHANNELS),
-        strides=(stride_wi, stride_wo),
-        offsets=(0, O_offset),
-        block_shape=(BLOCK_I, BLOCK_O),
-        order=(0, 1),
-    )
+    ### NOTE: Can we move the D block pointer outside one of these loops?
+    ### Can we store D less often? (transfer more at once, coalesce?)
+    ### I think we can somehow. Need to just mess around with indexing here
+    for h in range(0, tl.minimum(BLOCK_H, HEIGHT - (program_H_id * BLOCK_H))):
+        h_offset = h + (program_H_id * BLOCK_H)
+        for w in range(0, tl.minimum(BLOCK_W, WIDTH - (program_W_id * BLOCK_W))):
+            w_offset = w + (program_W_id * BLOCK_W)
 
-    WT2_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 1 ),
-        shape=(IN_CHANNELS, OUT_CHANNELS),
-        strides=(stride_wi, stride_wo),
-        offsets=(0, O_offset),
-        block_shape=(BLOCK_I, BLOCK_O),
-        order=(0, 1),
-    )
+            ### Create weight block pointer
+            WT1_block_ptr = tl.make_block_ptr(
+                base=W + ( stride_wp * 0 ),
+                shape=(IN_CHANNELS, OUT_CHANNELS),
+                strides=(stride_wi, stride_wo),
+                offsets=(0, O_offset),
+                block_shape=(BLOCK_I, BLOCK_O),
+                order=(0, 1),
+            )
 
-    X_block_ptr = tl.make_block_ptr(
-        base=X + (stride_xh * program_H_id) + (stride_xw * program_W_id),
-        shape=(BATCH_SIZE, IN_CHANNELS),
-        strides=(stride_xb, stride_xi),
-        offsets=(0, 0),
-        block_shape=(BATCH_SIZE, BLOCK_I),
-        order=(1, 0),
-    )
+            WT2_block_ptr = tl.make_block_ptr(
+                base=W + ( stride_wp * 1 ),
+                shape=(IN_CHANNELS, OUT_CHANNELS),
+                strides=(stride_wi, stride_wo),
+                offsets=(0, O_offset),
+                block_shape=(BLOCK_I, BLOCK_O),
+                order=(0, 1),
+            )
 
-    D_block_ptr = tl.make_block_ptr(
-        base=D + (stride_dh * program_H_id) + (stride_dw * program_W_id),
-        shape=(BATCH_SIZE, OUT_CHANNELS),
-        strides=(stride_db, stride_do),
-        offsets=(0, O_offset),
-        block_shape=(BATCH_SIZE, BLOCK_O),
-        order=(1, 0),
-    )
+            ### Create X and D block pointers (depend on h, w)
+            X_block_ptr = tl.make_block_ptr(
+                base=X + (stride_xh * h_offset) + (stride_xw * w_offset),
+                shape=(BATCH_SIZE, IN_CHANNELS),
+                strides=(stride_xb, stride_xi),
+                offsets=(0, 0),
+                block_shape=(BATCH_SIZE, BLOCK_I),
+                order=(1, 0),
+            )
 
-    ### Accumulation terms
-    t0_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
-    t1_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
+            D_block_ptr = tl.make_block_ptr(
+                base=D + (stride_dh * h_offset) + (stride_dw * w_offset),
+                shape=(BATCH_SIZE, OUT_CHANNELS),
+                strides=(stride_db, stride_do),
+                offsets=(0, O_offset),
+                block_shape=(BATCH_SIZE, BLOCK_O),
+                order=(1, 0),
+            )
 
-    for k in range(0, tl.cdiv(IN_CHANNELS, BLOCK_I)):
-        ### Load chunk of x
-        x = tl.load(X_block_ptr, padding_option="zero", boundary_check=(0,1))
+            ### Accumulation terms
+            t0_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
+            t1_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
 
-        ### Load w1, w2
-        wt1 = tl.load(WT1_block_ptr, padding_option="zero", boundary_check=(0,1))
-        wt2 = tl.load(WT2_block_ptr, padding_option="zero", boundary_check=(0,1))
+            k_upper_bound = tl.cdiv(IN_CHANNELS, BLOCK_I)
 
-        t0_accum = tl.dot(x, wt1, acc=t0_accum, input_precision="ieee")
-        t1_accum = tl.dot(x, wt2, acc=t1_accum, input_precision="ieee")
+            for k in range(0, k_upper_bound):
+                ### Load chunk of x
+                x = tl.load(X_block_ptr, padding_option="zero", boundary_check=(0,1))
 
-        ### Advance pointers
-        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_I))
-        WT1_block_ptr = tl.advance(WT1_block_ptr, (BLOCK_I, 0))
-        WT2_block_ptr = tl.advance(WT2_block_ptr, (BLOCK_I, 0))
+                ### Load w1, w2
+                wt1 = tl.load(WT1_block_ptr, padding_option="zero", boundary_check=(0,1))
+                wt2 = tl.load(WT2_block_ptr, padding_option="zero", boundary_check=(0,1))
 
+                t0_accum = tl.dot(x, wt1, acc=t0_accum, input_precision="ieee")
+                t1_accum = tl.dot(x, wt2, acc=t1_accum, input_precision="ieee")
 
-    ### Epilogue
-    tl.store(D_block_ptr, silu_activation_fwd_kernel(t0_accum) * t1_accum, boundary_check=(0,1))
+                ### Advance pointers
+                X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_I))
+                WT1_block_ptr = tl.advance(WT1_block_ptr, (BLOCK_I, 0))
+                WT2_block_ptr = tl.advance(WT2_block_ptr, (BLOCK_I, 0))
+
+            ### Reset WT1, WT2 pointers
+            # WT1_block_ptr = tl.advance(WT1_block_ptr, (-BLOCK_I * k_upper_bound, 0))
+            # WT2_block_ptr = tl.advance(WT2_block_ptr, (-BLOCK_I * k_upper_bound, 0))
+
+            ### Epilogue
+            tl.store(D_block_ptr, silu_activation_fwd_kernel(t0_accum) * t1_accum, boundary_check=(0,1))
 
 
 ###
@@ -255,7 +284,11 @@ def parallel_linear_fwd_fp32(
     X : torch.Tensor, # (BATCH_SIZE, IN_CHANNELS, HEIGHT, WIDTH)
     D : torch.Tensor = None, # (BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH)
     op : str = "add",
-) -> torch.Tensor:    
+) -> torch.Tensor:
+    ### Launch constats
+    BLOCK_H=1
+    BLOCK_W=1
+
     ### Get input shapes
     _, OUT_CHANNELS, _  = W.shape
     BATCH_SIZE, IN_CHANNELS, HEIGHT, WIDTH = X.shape
@@ -270,9 +303,7 @@ def parallel_linear_fwd_fp32(
     if not D:
         D = torch.empty((BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH), device=W.device, dtype=W.dtype, requires_grad=False).contiguous()
 
-    ### NOTE: 3D Kernel launch grid, we can change the 2nd dimension in case we decide to not do interleaved computation
-    ### NOTE: Can use jobid to decide behavior by doing that
-    grid = lambda META: (triton.cdiv(OUT_CHANNELS, META['BLOCK_O']), HEIGHT, WIDTH)
+    grid = lambda META: (triton.cdiv(OUT_CHANNELS, META['BLOCK_O']), triton.cdiv(HEIGHT, BLOCK_H), triton.cdiv(WIDTH, BLOCK_W))
 
     ### Launch it!
     if op == "add":
@@ -287,6 +318,8 @@ def parallel_linear_fwd_fp32(
             BATCH_SIZE,
             HEIGHT,
             WIDTH,
+            BLOCK_H=BLOCK_H,
+            BLOCK_W=BLOCK_W,
         )
     elif op == "mul":
         kernel = _parallel_linear_fwd_kernel_fp32_mul[grid](
@@ -300,6 +333,8 @@ def parallel_linear_fwd_fp32(
             BATCH_SIZE,
             HEIGHT,
             WIDTH,
+            BLOCK_H=BLOCK_H,
+            BLOCK_W=BLOCK_W,
         )   
 
     return D
@@ -339,7 +374,7 @@ if __name__ == "__main__":
     torch.set_printoptions(sci_mode=True)
 
     device = torch.device("cuda:0")
-    B, I, O, HEIGHT, WIDTH = 16, 64, 128, 8, 8
+    B, I, O, HEIGHT, WIDTH = 16, 64, 128, 16, 16
     W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
     X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)
 
@@ -353,7 +388,7 @@ if __name__ == "__main__":
     torch_us, triton_us = benchmark_latency(W, X, op="mul")
 
     print(f"max diff: {torch.max(torchf_linear_mul-triton_parallel_linear_mul)}")
-    print(f"latency torch / triton: {torch_us:.3f} / {triton_us:.3f}")
+    print(f"latency (us) torch / triton: {torch_us:.3f} / {triton_us:.3f}")
 
     print(f"\n=== Interleaved Linear Add ===")
 
@@ -365,6 +400,6 @@ if __name__ == "__main__":
     torch_us, triton_us = benchmark_latency(W, X, op="add")
 
     print(f"max diff: {torch.max(triton_parallel_linear_add-torchf_linear_add)}")
-    print(f"latency torch / triton: {torch_us:.3f} / {triton_us:.3f}")
+    print(f"latency (us) torch / triton: {torch_us:.3f} / {triton_us:.3f}")
     
     print(f"\n=== Done! ===")
