@@ -38,153 +38,177 @@ def gelu_activation_fwd_kernel(x : tl.tensor) -> tl.tensor:
 ###
 ### Configurations
 ###
-minimal_autotune_configs = [
-    triton.Config({'BLOCK_O': BM, 'BLOCK_I': BK}, num_stages=s, num_warps=w) \
-    for BM in [64, 256]\
-    for BK in [64, 256]\
+autotune_large_workload_config = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN, 'BLOCK_K': BK}, num_stages=s, num_warps=w) \
+    for BM in [128, 256]\
+    for BN in [64, 128]\
+    for BK in [64, 128]\
     for s in [2, 4]\
-    for w in [4]\
+    for w in [4, 8]\
+]
+
+
+autotune_small_workload_config = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN, 'BLOCK_K': BK}, num_stages=s, num_warps=w) \
+    for BM in [64, 128]\
+    for BN in [32, 64]\
+    for BK in [32, 64]\
+    for s in [2, 4]\
+    for w in [4, 8]\
 ]
 
 
 static_config = [
-    triton.Config({'BLOCK_O': 128, 'BLOCK_I': 128}, num_stages=3, num_warps=4)
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN, 'BLOCK_K': BK}, num_stages=s, num_warps=w) \
+    for BM in [64]\
+    for BN in [32]\
+    for BK in [32]\
+    for s in [2]\
+    for w in [4]\
 ]
 
-
-@triton.autotune(minimal_autotune_configs, key=['OUT_CHANNELS', 'HEIGHT', 'WIDTH', 'IN_CHANNELS'])
+@triton.autotune(static_config, key=['OUT_CHANNELS', 'BATCH_SIZE', 'HEIGHT', 'WIDTH'])
 @triton.jit
 def _dual_gemm_conv1x1_fwd_kernel_fp32(
-    W,       # (2, O, I)
-    X,       # (B, I, H, W) 
-    D,       # (B, O, H, W)
-    stride_wp, stride_wo, stride_wi,
+    X,  # Input tensor: (B, I, H, W)
+    W,  # Weight tensor: (2, O, I)
+    D,  # Output tensor: (B, O, H, W)
+    stride_wo, stride_wi, stride_wp,
     stride_xb, stride_xi, stride_xh, stride_xw,
     stride_db, stride_do, stride_dh, stride_dw,
+    BATCH_SIZE: tl.constexpr,
     IN_CHANNELS: tl.constexpr,
     OUT_CHANNELS: tl.constexpr,
-    BATCH_SIZE: tl.constexpr,
-    HEIGHT : tl.constexpr,
-    WIDTH : tl.constexpr,
-    ### Metaparams
-    BLOCK_O: tl.constexpr,
-    BLOCK_I: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-    ### Operation Details
-    op: tl.constexpr,
+    HEIGHT: tl.constexpr,
+    WIDTH: tl.constexpr,
+    OP : tl.constexpr,
+    BLOCK_M: tl.constexpr,  # Tile size for batch and spatial dimensions
+    BLOCK_N: tl.constexpr,  # Tile size for output channels
+    BLOCK_K: tl.constexpr,  # Tile size for input channels
 ):
-    ### Kernel-wide constants
-    dtype = tl.float32
+    ### Define block pointers
+    pid_m = tl.program_id(0)  # Handles the m dimension (batch and spatial)
+    pid_n = tl.program_id(1)  # Handles the n dimension (output channels)
 
-    ### Which program are we?
-    program_O_id = tl.program_id(axis=0)
-    program_H_id = tl.program_id(axis=1)
-    program_W_id = tl.program_id(axis=2)
+    ### Compute block starting positions
+    batch_id = pid_m // (HEIGHT * WIDTH)
+    hw_id = pid_m % (HEIGHT * WIDTH)
+    h_id = hw_id // WIDTH
+    w_id = hw_id % WIDTH
 
-    ### Compute any offsets
-    O_offset = program_O_id * BLOCK_O
+    ### GEMM Problem Coordinates
+    M = BATCH_SIZE * HEIGHT * WIDTH
+    N = OUT_CHANNELS
+    K = IN_CHANNELS
 
-    ### Create weight block pointer
+    ### GEMM Offsets
+    offset_M = pid_m * BLOCK_M
+    offset_N = pid_n * BLOCK_N
+
+    ### Input Pointer
+    X_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(M, K),
+        strides=(stride_xw, stride_xi),
+        offsets=(offset_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(1, 0)
+    )
+
+    ### W block pointer is 3D
     WT1_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 0 ),
-        shape=(IN_CHANNELS, OUT_CHANNELS),
+        base=W + (0 * stride_wp),
+        shape=(K, N),
         strides=(stride_wi, stride_wo),
-        offsets=(0, O_offset),
-        block_shape=(BLOCK_I, BLOCK_O),
-        order=(0, 1),
+        offsets=(0, offset_N),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(0, 1)
     )
 
     WT2_block_ptr = tl.make_block_ptr(
-        base=W + ( stride_wp * 1 ),
-        shape=(IN_CHANNELS, OUT_CHANNELS),
+        base=W + (1 * stride_wp),
+        shape=(K, N),
         strides=(stride_wi, stride_wo),
-        offsets=(0, O_offset),
-        block_shape=(BLOCK_I, BLOCK_O),
-        order=(0, 1),
+        offsets=(0, offset_N),
+        block_shape=(BLOCK_K, BLOCK_N),
+        order=(0, 1)
     )
 
-    ### Create X and D block pointers (depend on h, w)
-    X_block_ptr = tl.make_block_ptr(
-        base=X + (stride_xh * program_H_id) + (stride_xw * program_W_id),
-        shape=(BATCH_SIZE, IN_CHANNELS),
-        strides=(stride_xb, stride_xi),
-        offsets=(0, 0),
-        block_shape=(BATCH_SIZE, BLOCK_I),
-        order=(1, 0),
-    )
-
+    ### Destination Pointer
     D_block_ptr = tl.make_block_ptr(
-        base=D + (stride_dh * program_H_id) + (stride_dw * program_W_id),
-        shape=(BATCH_SIZE, OUT_CHANNELS),
-        strides=(stride_db, stride_do),
-        offsets=(0, O_offset),
-        block_shape=(BATCH_SIZE, BLOCK_O),
-        order=(1, 0),
+        base=D,
+        shape=(M, N),
+        strides=(stride_dw, stride_do),
+        offsets=(offset_M, offset_N),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0)
     )
 
-    ### Accumulation terms
-    t0_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
-    t1_accum = tl.zeros((BATCH_SIZE, BLOCK_O), dtype=dtype)
+    ### Initialize accumulator
+    acc_w0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_w1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    k_upper_bound = tl.cdiv(IN_CHANNELS, BLOCK_I)
-
-    for k in range(0, k_upper_bound):
-        ### Load chunk of x
+    ### Loop over all tiles of K dimension
+    for k in range(0, tl.cdiv(IN_CHANNELS, BLOCK_K)):
+        ### Grab X
         x = tl.load(X_block_ptr, padding_option="zero", boundary_check=(0,1))
-
-        ### Load w1, w2
+        ### Load, Dot, Load, Dot
         wt1 = tl.load(WT1_block_ptr, padding_option="zero", boundary_check=(0,1))
+        acc_w0 = tl.dot(x, wt1, acc=acc_w0, input_precision="ieee")
         wt2 = tl.load(WT2_block_ptr, padding_option="zero", boundary_check=(0,1))
+        acc_w1 = tl.dot(x, wt2, acc=acc_w1, input_precision="ieee")
 
-        t0_accum = tl.dot(x, wt1, acc=t0_accum, input_precision="ieee")
-        t1_accum = tl.dot(x, wt2, acc=t1_accum, input_precision="ieee")
-
-        ### Advance pointers
-        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_I))
-        WT1_block_ptr = tl.advance(WT1_block_ptr, (BLOCK_I, 0))
-        WT2_block_ptr = tl.advance(WT2_block_ptr, (BLOCK_I, 0))
+        ### Advance the block pointers for the next iteration in GEMM K dimension
+        X_block_ptr = tl.advance(X_block_ptr, (0, BLOCK_K))
+        WT1_block_ptr = tl.advance(WT1_block_ptr, (BLOCK_K, 0))
+        WT2_block_ptr = tl.advance(WT2_block_ptr, (BLOCK_K, 0))
 
     ### Epilogue
-    Z = silu_activation_fwd_kernel(t0_accum)
+    acc_w0 = silu_activation_fwd_kernel(acc_w0)
 
-    if op & 1:
-        Z *= t1_accum
+    ### Switch behavior based on op input
+    ### op == 1 --> multiply
+    ### op == 0 --> add
+    if OP & 1:
+        acc_w0 *= acc_w1
     else:
-        Z += t1_accum
+        acc_w0 += acc_w1
 
     ### Epilogue
-    tl.store(D_block_ptr, Z, boundary_check=(0,1))
+    tl.store(D_block_ptr, acc_w0, boundary_check=(0,1))
 
 
 ###
 ### Multi-headed Attention Forward
 ###
 def dual_conv1x1_fwd_fp32(
-    W : torch.Tensor, # (2, OUT_CHANNELS, IN_CHANNELS)
+    W : torch.Tensor, # (OUT_CHANNELS, IN_CHANNELS, 2)
     X : torch.Tensor, # (BATCH_SIZE, IN_CHANNELS, HEIGHT, WIDTH)
     D : torch.Tensor = None, # (BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH)
     op : str = "add",
 ) -> torch.Tensor:
-    ### Launch constants
-    BLOCK_H=1
-    BLOCK_W=1
-
     ### Get input shapes
     _, OUT_CHANNELS, _  = W.shape
     BATCH_SIZE, IN_CHANNELS, HEIGHT, WIDTH = X.shape
 
     ### Input Checking
-    assert W.is_contiguous() and X.is_contiguous(), "Must have contiguous tensors"
-    assert W.device == X.device, "Must have same device"
+    assert W.device == X.device and "cuda" in str(X.device), "Must have same CUDA device"
     assert W.dtype == X.dtype, "Must have same dtype"
     assert op in ["add", "mul"], "Invalid op"
 
-    ### Allocates output destination
+    ### Allocates output and check input
     if not D:
-        D = torch.empty((BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH), device=W.device, dtype=W.dtype, requires_grad=False).contiguous()
+        D = torch.empty((BATCH_SIZE, OUT_CHANNELS, HEIGHT, WIDTH), device=W.device, dtype=W.dtype, requires_grad=False)#.contiguous(memory_format=torch.channels_last)
+    else:
+        assert "cuda" in str(D.device), "D must be CUDA device"
+        assert D.dtype == X.dtype, "D must have same dtype has X"
 
-    grid = lambda META: (triton.cdiv(OUT_CHANNELS, META['BLOCK_O']), triton.cdiv(HEIGHT, BLOCK_H), triton.cdiv(WIDTH, BLOCK_W))
+    ### Implicit 2D GEMM Grid
+    grid = lambda META: (
+        triton.cdiv(BATCH_SIZE * HEIGHT * WIDTH, META['BLOCK_M']),
+        triton.cdiv(OUT_CHANNELS, META['BLOCK_N']),
+        1,
+    )
 
     kernel = _dual_gemm_conv1x1_fwd_kernel_fp32[grid](
         ### Standard params
@@ -192,19 +216,20 @@ def dual_conv1x1_fwd_fp32(
         W.stride(0), W.stride(1), W.stride(2),
         X.stride(0), X.stride(1), X.stride(2), X.stride(3),
         D.stride(0), D.stride(1), D.stride(2), D.stride(3),
+        BATCH_SIZE,
         IN_CHANNELS,
         OUT_CHANNELS,
-        BATCH_SIZE,
         HEIGHT,
         WIDTH,
-        BLOCK_H=BLOCK_H,
-        BLOCK_W=BLOCK_W,
-        op=1 if op=="mul" else 0,
+        OP=1 if op=="mul" else 0,
+        ### Metaparameters
     )   
 
     return D
 
-
+###
+### TODO IMPORTANT! - Make sure W has the right shape (we are now implementing it as O,I,2 instead of 2,O,I)
+###
 if __name__ == "__main__":
     def benchmark_latency(W, X, op : str, N : int = 64):
         def _torch_mul(W, X):
@@ -239,9 +264,9 @@ if __name__ == "__main__":
     torch.set_printoptions(sci_mode=True)
 
     device = torch.device("cuda:0")
-    B, I, O, HEIGHT, WIDTH = 16, 128, 256, 16, 16
+    B, I, O, HEIGHT, WIDTH = 32, 128, 256, 32, 32
     W = torch.randn((2,O,I), device=device, dtype=torch.float32, requires_grad=False)
-    X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)
+    X = torch.randn((B,I,HEIGHT,WIDTH), device=device, dtype=torch.float32, requires_grad=False)#.contiguous(memory_format=torch.channels_last)
 
     print(f"=== Interleaved Linear Mul ===")
 
