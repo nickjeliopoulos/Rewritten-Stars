@@ -111,6 +111,8 @@ if __name__ == "__main__":
     X = torch.ones((N, B, Q), device=device, dtype=torch.float32, requires_grad=False)
     D = collapsed_dim_add(X, None)
 
-    print(f"X: {X}")
+    print(f"X: {X[0,0,:]}")
     print(f"============")
-    print(f"D: {D}")
+    print(f"D: {D[0,0,:]}")
+    print(f"============")
+    print(f"MaxAbsDiff wrt reference X+X: {torch.max(torch.abs((X + X) - D))}")
